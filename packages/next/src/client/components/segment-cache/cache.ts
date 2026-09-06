@@ -2818,13 +2818,6 @@ function writeResponsePayloadsIntoCache(
   // writeServerResponseIntoCache.
   map: CacheMap<SegmentCacheEntry>
 ): Array<FulfilledSegmentCacheEntry> | null {
-  const isStaticResponse =
-    fetchStrategy === FetchStrategy.PPR ||
-    fetchStrategy === FetchStrategy.StaticShell
-  const shellWasRequested =
-    fetchStrategy === FetchStrategy.StaticShell ||
-    fetchStrategy === FetchStrategy.RuntimeShell
-
   let fulfilledEntries: Array<FulfilledSegmentCacheEntry> | null
   if (shellPayload === null) {
     if (fetchStrategy === FetchStrategy.StaticShell) {
@@ -2892,6 +2885,19 @@ function writeResponsePayloadsIntoCache(
     // evidence, so it must not be parked in the shell slot on the strength
     // of the missing split alone (see the keying derivation in
     // writeSegmentDataIntoCache).
+
+    // - a StaticShell fetch strategy always uses from a a PPR-tier request,
+    //   but it needs to fulfill ShellStatic entries. The shell and the response were
+    //   the same, so we need to fulfill them at the PPR tier.
+    // - a RuntimeShell request does not contain any extra data, and cannot be rewound,
+    //   so it should never end up in this branch (it uses the null-shell branch above instead)
+    // - a PPRRuntime request only ever happens *after* a RuntimeShell request has completed
+    //   (when `prefetchTask.phase` is `Speculative`)
+    //   and does not fulfill pending ShellRuntime entries, so we can't have a discrepancy
+    //   between the `fetchStrategy` and the content.
+    const contentFetchStrategy =
+      fetchStrategy === FetchStrategy.StaticShell ? FetchStrategy.PPR : null
+
     fulfilledEntries = writeServerResponseIntoCache(
       now,
       fetchStrategy,
@@ -2905,16 +2911,7 @@ function writeResponsePayloadsIntoCache(
       isFullResponsePartial,
       metadataVaryPath,
       spawnedEntries,
-      // The full payload's tier: PPR for a static response, PPRRuntime for
-      // a runtime response (whose full payload is everything a runtime
-      // prefetch can produce when nothing lies below the shell). For a
-      // full-tier request it agrees with the request's own strategy, so
-      // only shell-tier requests pass it.
-      shellWasRequested
-        ? isStaticResponse
-          ? FetchStrategy.PPR
-          : FetchStrategy.PPRRuntime
-        : null,
+      contentFetchStrategy,
       map
     )
   } else {
@@ -2937,20 +2934,20 @@ function writeResponsePayloadsIntoCache(
     // so the shell write's precedence checks and shadow eviction compare
     // against the fresh concrete entry rather than whatever stale entry
     // preceded it.
+
+    const fetchStrategyForFullResponse =
+      fetchStrategy === FetchStrategy.StaticShell
+        ? // a StaticShell fetch strategy performs a request that returns
+          // a PPR-tier response that can be rewound to a StaticShell response.
+          // This write is for the full response, so we upgrade the strategy to `PPR`.
+          FetchStrategy.PPR
+        : // Otherwise, keep the original strategy -- this is the full response, so
+          // it is accurate.
+          fetchStrategy
+
     const fullFulfilledEntries = writeServerResponseIntoCache(
       now,
-      // The full payload is written at the request's own tier, except for
-      // shell-tier requests: when a shell request returns more than the
-      // shell, the extra content is at least as complete as what the
-      // corresponding non-shell request would have returned — PPR for a
-      // StaticShell request, PPRRuntime for a RuntimeShell request. Record
-      // that tier so the scheduler doesn't re-request content this payload
-      // already provides. (Same rule as the coincident-shell case below.)
-      shellWasRequested
-        ? isStaticResponse
-          ? FetchStrategy.PPR
-          : FetchStrategy.PPRRuntime
-        : fetchStrategy,
+      fetchStrategyForFullResponse,
       fullPayload,
       baseTree,
       predictedFromRoute,
@@ -2960,13 +2957,30 @@ function writeResponsePayloadsIntoCache(
       staleAt,
       isFullResponsePartial,
       metadataVaryPath,
-      shellWasRequested ? null : spawnedEntries,
+      isShellStrategy(fetchStrategy) ? null : spawnedEntries,
       null,
       map
     )
+
+    const fetchStrategyForShell =
+      fetchStrategy === FetchStrategy.Full
+        ? // Navigation responses contain a *static* app shell.
+          // On PPF routes they also contain a runtime prefetch stream which will give us
+          // a runtime shell/prefetch, but that's handled separately from the main response.
+          // (see `writeRuntimePrefetchStreamIntoCache`)
+          FetchStrategy.StaticShell
+        : // Otherwise, static responses contain static shells, and runtime
+          // responses contain static shells.
+          // (A static shell's tier may be raised if we know that a static request
+          // would satisfy a runtime request -- see `recordedFetchStrategy` in
+          // `writeSegmentDataIntoCache`)
+          isStaticStrategy(fetchStrategy)
+          ? FetchStrategy.StaticShell
+          : FetchStrategy.RuntimeShell
+
     const shellFulfilledEntries = writeServerResponseIntoCache(
       now,
-      isStaticResponse ? FetchStrategy.StaticShell : FetchStrategy.RuntimeShell,
+      fetchStrategyForShell,
       shellPayload,
       baseTree,
       predictedFromRoute,
@@ -2984,11 +2998,11 @@ function writeResponsePayloadsIntoCache(
       // by construction.
       true,
       metadataVaryPath,
-      shellWasRequested ? spawnedEntries : null,
+      isShellStrategy(fetchStrategy) ? spawnedEntries : null,
       null,
       map
     )
-    fulfilledEntries = shellWasRequested
+    fulfilledEntries = isShellStrategy(fetchStrategy)
       ? shellFulfilledEntries
       : fullFulfilledEntries
   }
@@ -3006,6 +3020,26 @@ function writeResponsePayloadsIntoCache(
     }
   }
   return fulfilledEntries
+}
+
+type ShellFetchStrategy = FetchStrategy.StaticShell | FetchStrategy.RuntimeShell
+function isShellStrategy(
+  fetchStrategy: FetchStrategy
+): fetchStrategy is ShellFetchStrategy {
+  return (
+    fetchStrategy === FetchStrategy.StaticShell ||
+    fetchStrategy === FetchStrategy.RuntimeShell
+  )
+}
+
+type StaticFetchStrategy = FetchStrategy.StaticShell | FetchStrategy.PPR
+function isStaticStrategy(
+  fetchStrategy: FetchStrategy
+): fetchStrategy is StaticFetchStrategy {
+  return (
+    fetchStrategy === FetchStrategy.StaticShell ||
+    fetchStrategy === FetchStrategy.PPR
+  )
 }
 
 /**
@@ -3079,7 +3113,7 @@ function writeServerResponseIntoCache(
   // when it differs from `fetchStrategy` (which drives matching and
   // keying); null when they agree. See the param docs on
   // writeSegmentDataIntoCache.
-  contentFetchStrategy: FetchStrategy.PPR | FetchStrategy.PPRRuntime | null,
+  contentFetchStrategy: FetchStrategy.PPR | null,
   // The map the work that spawned this response's request is bound to: the
   // spawning task's `PrefetchTask.segmentCacheMap` for prefetches, the
   // navigation's map for navigation-side writes. Binding the write to the
@@ -3271,7 +3305,7 @@ function writeTreeDataIntoCache(
   tree: RouteTree<RSCSegmentData | null>,
   staleAt: number,
   spawnedEntries: Map<SegmentRequestKey, PendingSegmentCacheEntry> | null,
-  contentFetchStrategy: FetchStrategy.PPR | FetchStrategy.PPRRuntime | null,
+  contentFetchStrategy: FetchStrategy.PPR | null,
   isUpgradeableISRFallback: boolean,
   responseNeedsRuntimeRequest: boolean | null,
   // Accumulates the entries the walk wrote content into (fulfilled spawned
@@ -3368,9 +3402,8 @@ function writeSegmentDataIntoCache(
   // drives matching and keying); null when they agree. It differs only for
   // the coincident-shell case: a write that fulfills shell-keyed entries
   // with a payload that IS the full response passes the full payload's tier
-  // (PPR for a per-segment static response, PPRRuntime for a RuntimeShell
-  // response) — see writeResponsePayloadsIntoCache.
-  contentFetchStrategy: FetchStrategy.PPR | FetchStrategy.PPRRuntime | null,
+  // — see writeResponsePayloadsIntoCache.
+  contentFetchStrategy: FetchStrategy.PPR | null,
   // Whether the response is an upgradeable fallback shell. Always false for
   // live-render responses — they are never ISR fallbacks.
   isUpgradeableISRFallback: boolean,
